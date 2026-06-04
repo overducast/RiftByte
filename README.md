@@ -15,7 +15,7 @@ Compares two binaries byte-by-byte, resolves virtual addresses, identifies secti
 - Prints **jump/call targets** for branch instructions
 - Shows surrounding byte context for each diff
 - Exports a **`.log`** file with full diff summary
-- Exports a **`.1337`** patch file compatible with **x64dbg / x32dbg / arm64dbg**
+- Exports a **`.1337`** patch file compatible with **x64dbg / x32dbg 
 - Colored terminal output (ANSI, works in Windows Console)
 - Detects `.NET` assemblies
 
