@@ -1183,7 +1183,7 @@ static void save_log_to_file(const char *file1, const char *file2) {
             fprintf(out, "       %-30s -> %-30s\n", e->before_op, e->after_op);
             fprintf(out, "       %-48s -> %s\n",    e->before_bytes, e->after_bytes);
             if (e->has_jump)
-                fprintf(out, "       jumpp target: %016llX\n",
+                fprintf(out, "       jump target: %016llX\n",
                         (unsigned long long)e->jump_target);
             fprintf(out, "\n");
         }
@@ -1232,8 +1232,10 @@ static void save_1337(const char *file1) {
             /* RVA = VA - ImageBase; for x64dbg .1337 uses */
             uint64_t rva = (e->va + (uint64_t)k) - imageBase;
 
-            fprintf(out, "%016llX:%02X->%02X\n",
-                    (unsigned long long)rva, b, a);
+            if (is64bit)
+                fprintf(out, "%016llX:%02X->%02X\n", (unsigned long long)rva, b, a);
+            else
+                fprintf(out, "%08llX:%02X->%02X\n", (unsigned long long)rva, b, a);
         }
     }
 
@@ -1290,7 +1292,7 @@ static void print_log_summary(void) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
-    SetConsoleOutputCP(65001); /* ascii */
+    SetConsoleOutputCP(65001); /* UTF-8 */
     SetConsoleCP(65001);
     {
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1374,19 +1376,71 @@ int main(int argc, char **argv) {
 
     uint8_t b1[CHUNK], b2[CHUNK];
     uint64_t off = 0;
+    /* pending cross-chunk diff accumulation */
+    uint64_t pend_file_off = 0;
+    int      pend_active   = 0;
+    uint8_t  pend_b[MAX_PATCH_BYTES], pend_a[MAX_PATCH_BYTES];
+    int      pend_len      = 0;
 
     while (1) {
         size_t r1 = fread(b1, 1, CHUNK, f1);
         size_t r2 = fread(b2, 1, CHUNK, f2);
         size_t r  = (r1 < r2) ? r1 : r2;
+
+        /* flush pending diff if the new chunk starts with a match (or file ended) */
+        if (pend_active && (!r || b1[0] == b2[0])) {
+            pend_active = 0;
+            size_t grp_start = 0, grp_end = (size_t)pend_len - 1;
+            uint64_t file_off = pend_file_off;
+            uint64_t va; const char *sec;
+            if (fileFormat == FMT_ELF) { va = elf_file_to_va(file_off); sec = elf_sec_name_at(va); }
+            else { uint32_t rva = file_to_rva((uint32_t)file_off); va = rva_to_va(rva); sec = sec_name_at_rva(rva); }
+            const char *a    = decode_opcode(pend_b[0]);
+            const char *b_op = decode_opcode(pend_a[0]);
+            char bytes_before[4096] = {0}, bytes_after[4096] = {0};
+            int bp = 0, ap = 0;
+            for (int k = 0; k < pend_len && bp < 4080; k++) bp += sprintf(bytes_before + bp, "%02X ", pend_b[k]);
+            for (int k = 0; k < pend_len && ap < 4080; k++) ap += sprintf(bytes_after  + ap, "%02X ", pend_a[k]);
+            if (bp > 0) bytes_before[bp - 1] = 0;
+            if (ap > 0) bytes_after [ap - 1] = 0;
+            int has_jump = 0; uint64_t jump_target = 0;
+            if (!isArm) {
+                if (is_jump_or_call(pend_a[0])) { uint8_t tmp[5]; memcpy(tmp, pend_a, pend_len < 5 ? pend_len : 5); has_jump = get_jump_target(tmp, 0, pend_len < 5 ? pend_len : 5, va, &jump_target); if (has_jump) printf(CLR_GREY "  jump target: " CLR_YELLOW "%016llX" CLR_RESET "\n", (unsigned long long)jump_target); }
+                else if (is_jump_or_call(pend_b[0])) { uint8_t tmp[5]; memcpy(tmp, pend_b, pend_len < 5 ? pend_len : 5); has_jump = get_jump_target(tmp, 0, pend_len < 5 ? pend_len : 5, va, &jump_target); if (has_jump) printf(CLR_GREY "  jump target: " CLR_YELLOW "%016llX" CLR_RESET "\n", (unsigned long long)jump_target); }
+            }
+            if (is64bit) printf(CLR_GREY "[ %s ] %s " CLR_WHITE "%016llX" CLR_GREY "   OFF:0x%016llX | " CLR_CYAN "%-30s" CLR_GREY " -> " CLR_CYAN "%-30s" CLR_GREY " (" CLR_RED "%s" CLR_GREY " -> " CLR_RED "%s" CLR_GREY ")" CLR_RESET "\n", sec, dbg_label, (unsigned long long)va, (unsigned long long)file_off, a, b_op, bytes_before, bytes_after);
+            else         printf(CLR_GREY "[ %s ] %s " CLR_WHITE "%08llX"   CLR_GREY "   OFF:0x%08llX | "   CLR_CYAN "%-30s" CLR_GREY " -> " CLR_CYAN "%-30s" CLR_GREY " (" CLR_RED "%s" CLR_GREY " -> " CLR_RED "%s" CLR_GREY ")" CLR_RESET "\n", sec, dbg_label, (unsigned long long)va, (unsigned long long)file_off, a, b_op, bytes_before, bytes_after);
+            log_add(sec, va, file_off, a, b_op, bytes_before, bytes_after, pend_b, pend_a, pend_len, has_jump, jump_target);
+            (void)grp_start; (void)grp_end;
+        }
+
         if (!r) break;
 
         size_t i = 0;
+        /* if still in a pending diff at the start of the new chunk, extend it */
+        if (pend_active) {
+            while (i < r && b1[i] != b2[i]) {
+                if (pend_len < MAX_PATCH_BYTES) { pend_b[pend_len] = b1[i]; pend_a[pend_len] = b2[i]; pend_len++; }
+                i++;
+            }
+            if (i < r) pend_active = 0; /* ended within this chunk; will be flushed next iteration or below */
+        }
+
         while (i < r) {
             if (b1[i] != b2[i]) {
                 size_t grp_start = i;
                 while (i < r && b1[i] != b2[i]) i++;
                 size_t grp_end = i - 1;
+
+                /* diff hit the chunk boundary — defer to next iteration */
+                if (i == r) {
+                    pend_file_off = off + (uint64_t)grp_start;
+                    pend_len = (int)(grp_end - grp_start + 1);
+                    if (pend_len > MAX_PATCH_BYTES) pend_len = MAX_PATCH_BYTES;
+                    for (int k = 0; k < pend_len; k++) { pend_b[k] = b1[grp_start + (size_t)k]; pend_a[k] = b2[grp_start + (size_t)k]; }
+                    pend_active = 1;
+                    break;
+                }
 
                 uint64_t file_off = off + (uint64_t)grp_start;
                 uint64_t va;
@@ -1501,7 +1555,6 @@ int main(int argc, char **argv) {
             printf(CLR_YELLOW "  [!] size mismatch\n" CLR_RESET);
             break;
         }
-        if (!r1 || !r2) break;
     }
 
     fclose(f1);
